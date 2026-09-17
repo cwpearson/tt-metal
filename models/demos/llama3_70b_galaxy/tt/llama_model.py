@@ -375,25 +375,29 @@ class TtTransformer(LightweightModule):
                 return padded
 
             if batch_size > 1:
-                assert batch_size == 32, "batch_size must be 32 for batched prefill"
+                assert batch_size <= self.args.max_batch_size, (
+                    f"batch_size {batch_size} must be <= max_batch_size {self.args.max_batch_size}"
+                )
                 # Mesh layout padding: (32, num_blocks) -> (4, 32 * num_blocks).
                 # For non-chunked SDPA, use -1 for unused regions so paged_fill_cache skips writes.
                 # For chunked SDPA (prefix caching), use 0 so SDPA doesn't read -1.
-                batch_size_per_column = batch_size // columns
+                batch_size_per_column = self.args.batch_size_per_device_group
                 page_table_padded = (
-                    torch.ones((columns, page_table.shape[1] * batch_size), dtype=torch.int32) * inactive_fill_value
+                    torch.ones(
+                        (columns, page_table.shape[1] * self.args.max_batch_size), dtype=torch.int32
+                    )
+                    * inactive_fill_value
                 )
                 for i in range(columns):
-                    row_block = page_table[i * batch_size_per_column : (i + 1) * batch_size_per_column, :].reshape(
-                        1, -1
-                    )
-                    page_table_padded[
-                        i,
-                        (i * batch_size_per_column)
-                        * page_table.shape[1] : (i + 1)
-                        * batch_size_per_column
-                        * page_table.shape[1],
-                    ] = row_block
+                    start_row = i * batch_size_per_column
+                    end_row = min((i + 1) * batch_size_per_column, page_table.shape[0])
+                    if start_row >= end_row:
+                        continue
+
+                    row_block = page_table[start_row:end_row, :].reshape(1, -1)
+                    write_start = start_row * page_table.shape[1]
+                    write_end = write_start + row_block.shape[1]
+                    page_table_padded[i, write_start:write_end] = row_block
                 chunk_page_table_padded = None  # batch_size>1 => no prefix caching => no chunk_page_table
             else:
                 # Mesh layout padding: only the active column is used.

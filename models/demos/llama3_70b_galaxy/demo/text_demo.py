@@ -17,6 +17,7 @@ import ttnn
 from models.common.utility_functions import comp_pcc
 from models.common.weight_cache import build_cached_state_dict, mark_weight_cache_complete, weight_cache_is_complete
 from models.demos.llama3_70b_galaxy.tt.generator import Generator, SamplingParams
+from models.demos.llama3_70b_galaxy.tt.constants import INTERNAL_BATCH_SIZE, SUPPORTED_BATCH_SIZES
 from models.demos.llama3_70b_galaxy.tt.model_config import LlamaOptimizations
 from models.demos.utils.device_sku import get_current_device_sku_name
 from models.demos.utils.llm_demo_utils import verify_perf
@@ -24,6 +25,44 @@ from models.demos.utils.model_targets import resolve_perf_targets
 from models.demos.utils.trace_region_sizes import TRACE_MODEL_KEY_PARAM
 from models.perf.benchmarking_utils import BenchmarkData, BenchmarkProfiler
 from models.tt_transformers.tt.common import PagedAttentionConfig, preprocess_inputs_prefill
+
+
+def pad_active_rows_to_internal_batch(tensor, active_rows, pad_value):
+    if tensor is None:
+        return None
+
+    if active_rows > INTERNAL_BATCH_SIZE:
+        raise ValueError(f"batch_size {active_rows} exceeds internal batch size {INTERNAL_BATCH_SIZE}")
+
+    if tensor.ndim == 1:
+        return torch.nn.functional.pad(tensor[:active_rows], (0, INTERNAL_BATCH_SIZE - active_rows), value=pad_value)
+
+    if tensor.ndim == 2:
+        return torch.nn.functional.pad(tensor[:active_rows], (0, 0, 0, INTERNAL_BATCH_SIZE - active_rows), value=pad_value)
+
+    raise ValueError(f"Unsupported tensor rank for batch padding: {tensor.ndim}")
+
+
+def pad_decode_tokens_to_internal_batch(tokens, active_batch_size):
+    tokens = torch.as_tensor(tokens, dtype=torch.long)
+
+    if tokens.ndim == 0:
+        tokens = tokens.reshape(1, 1)
+    elif tokens.ndim == 1:
+        tokens = tokens.reshape(-1, 1)
+
+    if tokens.shape[0] > INTERNAL_BATCH_SIZE:
+        raise ValueError(f"Decode token batch {tokens.shape[0]} exceeds internal batch size {INTERNAL_BATCH_SIZE}")
+
+    if tokens.shape[0] < active_batch_size:
+        fill_row = tokens[-1:, :] if tokens.shape[0] > 0 else torch.zeros((1, tokens.shape[1]), dtype=torch.long)
+        tokens = torch.cat([tokens, fill_row.repeat(active_batch_size - tokens.shape[0], 1)], dim=0)
+
+    if tokens.shape[0] < INTERNAL_BATCH_SIZE:
+        fill_row = tokens[-1:, :] if tokens.shape[0] > 0 else torch.zeros((1, tokens.shape[1]), dtype=torch.long)
+        tokens = torch.cat([tokens, fill_row.repeat(INTERNAL_BATCH_SIZE - tokens.shape[0], 1)], dim=0)
+
+    return tokens
 
 
 def load_and_cache_context(context_url, cache_dir, max_length=None):
@@ -924,9 +963,11 @@ def test_demo_text(
 
     prefetcher_common.global_tt_tensor_address = None
 
-    # TODO: Remove this once all batch sizes are supported on TG
-    if os.environ.get("MESH_DEVICE") == "TG" and batch_size not in [1, 32]:
-        pytest.skip("Llama TG only supports batch-32")
+    if batch_size not in SUPPORTED_BATCH_SIZES:
+        raise ValueError(f"Unsupported batch size {batch_size}; expected one of {SUPPORTED_BATCH_SIZES}")
+
+    if os.environ.get("MESH_DEVICE") == "TG" and batch_size not in SUPPORTED_BATCH_SIZES:
+        pytest.skip(f"Llama TG only supports batch sizes {SUPPORTED_BATCH_SIZES}")
     if apc_test and not pcc_check:
         raise ValueError("APC test requires PCC check to be enabled")
     if apc_test:
@@ -961,6 +1002,17 @@ def test_demo_text(
     print_outputs = request.config.getoption("--print_outputs") or print_outputs
     token_accuracy = request.config.getoption("--token_accuracy") or token_accuracy
 
+    if batch_size not in SUPPORTED_BATCH_SIZES:
+        raise ValueError(f"Unsupported batch size {batch_size}; expected one of {SUPPORTED_BATCH_SIZES}")
+
+    if batch_size != INTERNAL_BATCH_SIZE:
+        if is_cur_pos_sharded:
+            logger.info("Disabling current-position sharding for batch sizes smaller than 32")
+            is_cur_pos_sharded = False
+        if is_page_table_sharded:
+            logger.info("Disabling page-table sharding for batch sizes smaller than 32")
+            is_page_table_sharded = False
+
     if token_accuracy and pcc_check:
         raise ValueError("Token accuracy and PCC check are separate demo modes")
     if token_accuracy and batch_size != 1:
@@ -984,7 +1036,7 @@ def test_demo_text(
         ]
         * 8
         if batch_size == 32
-        else [15384 * 8]
+        else [15384 * 8] * batch_size
     )
 
     # Creat batch output file
@@ -1183,14 +1235,8 @@ def test_demo_text(
         assert (
             max_generated_tokens + max_encoded_prompt_len <= max_seq_len
         ), f"Prompt prefill tokens ({max_encoded_prompt_len}) + maximum number of decoded iterations ({max_generated_tokens}) needs to be <= than max_seq_len ({max_seq_len})"
-        batch_size_per_device_group = (
-            32 if batch_size == 32 else 1
-        )  # This is a workoaround until page table needs to know that attention is DP
-
         if paged_attention:
-            paged_cache_max_seq_len = (
-                page_params["page_block_size"] * page_params["page_max_num_blocks"] / batch_size_per_device_group
-            )
+            paged_cache_max_seq_len = page_params["page_block_size"] * page_table.shape[1]
             assert (
                 max_generated_tokens + max_encoded_prompt_len <= paged_cache_max_seq_len
             ), f"max_generated_tokens ({max_generated_tokens}) needs to be <= than paged_cache_max_seq_len ({paged_cache_max_seq_len})"
@@ -1349,12 +1395,8 @@ def test_demo_text(
         user_done = [False] * batch_size
 
         # Initial positions
-        current_pos = torch.tensor([decoding_pos[b] for b in range(batch_size)])
-        if batch_size == 1:
-            # pad current_pos to 32 with -1s
-            current_pos = torch.nn.functional.pad(current_pos, (0, 32 - current_pos.shape[0]), value=-1)
-            # pad page_table to 32 with 0s
-            page_table = torch.nn.functional.pad(page_table, (0, 0, 0, 32 - page_table.shape[0]), value=0)
+        current_pos = pad_active_rows_to_internal_batch(torch.tensor([decoding_pos[b] for b in range(batch_size)]), batch_size, -1)
+        page_table = pad_active_rows_to_internal_batch(page_table, batch_size, 0)
 
         # Start decoding
         iteration = 0
@@ -1365,8 +1407,7 @@ def test_demo_text(
         if token_accuracy:
             out_tok = token_acc.collect_predicted_tokens(out_tok[0].item())
 
-        if out_tok.shape == torch.Size([]) or (len(out_tok.shape) > 0 and out_tok.shape[0] != 32):
-            out_tok = out_tok.repeat(32, 1)
+        out_tok = pad_decode_tokens_to_internal_batch(out_tok, batch_size)
 
         try:
             model.switch_mode("decode")
@@ -1386,8 +1427,7 @@ def test_demo_text(
         while users_decoding:
             if token_accuracy and iteration > 0:
                 out_tok = token_acc.collect_predicted_tokens(out_tok[0].item())
-                if out_tok.shape == torch.Size([]) or (len(out_tok.shape) > 0 and out_tok.shape[0] != 32):
-                    out_tok = out_tok.repeat(32, 1)
+                out_tok = pad_decode_tokens_to_internal_batch(out_tok, batch_size)
 
             if iteration == 0:  # First iteration also accounts for compile time
                 profiler.start(f"compile_decode", iteration=batch_idx)
@@ -1456,8 +1496,7 @@ def test_demo_text(
                 else:
                     out_tok = tt_out_tok.reshape(-1).to(torch.long)
 
-                if out_tok.shape == torch.Size([]) or (len(out_tok.shape) > 0 and out_tok.shape[0] != 32):
-                    out_tok = out_tok.repeat(32, 1)
+                out_tok = pad_decode_tokens_to_internal_batch(out_tok, batch_size)
 
                 if teacher_forcing or (apc_test and iteration == 1):
                     if apc_test:

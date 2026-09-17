@@ -18,6 +18,7 @@ from models.common.llama_models import (
 )
 from models.common.sampling import SamplingParams, broadcast_sampling_params, format_sampling_params
 from models.common.warmup import WarmupForwardMixin
+from models.demos.llama3_70b_galaxy.tt.constants import SUPPORTED_BATCH_SIZES
 from models.demos.llama3_70b_galaxy.tt.model_config import SDPA_CHUNK_ALIGN
 from models.tt_transformers.tt.common import (
     InterleavedTextMedia,
@@ -313,10 +314,11 @@ class Generator(WarmupForwardMixin):
         logger.info("Warming up prefill for all supported sequence lengths up to max sequence length")
         warmup_sequence_lengths = get_prefill_warmup_sequence_lengths(self.model.args.max_seq_len)
         block_size = get_block_size(kv_cache[0]) if kv_cache else 64
-        # Phase 1: sp0 traces (no prefix caching) - batch 1 and 32
+        # Phase 1: sp0 traces (no prefix caching) - all supported active batch sizes, padded into the
+        # model's internal 32-slot layout for the batched prefill path.
         for warmup_sequence_length in warmup_sequence_lengths:
             # Capture trace for both
-            for batch in (1, 32):  # TODO add proper support for batched prefill == b-32
+            for batch in SUPPORTED_BATCH_SIZES:
                 # For batched prefill this needs to be *32
                 if batch == 32 and warmup_sequence_length >= 4096:
                     # For batched prefill max batch sequence length is 2048 or lower (128k limit), so we skip warmup for sequence lengths >= 4096
@@ -327,7 +329,7 @@ class Generator(WarmupForwardMixin):
                 logger.info(
                     f"Running warmup prefill for sequence length: {warmup_sequence_length}, batch size: {batch}"
                 )
-                if batch == 32:
+                if batch > 1:
                     current_batch = page_table.shape[0]
                     if current_batch < batch:
                         pad_rows = batch - current_batch
